@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Compiled C artifacts
+*.dylib
+*.so
+*.o
+
+# LaTeX/knitr generated intermediates
+*.aux
+*.log
+*.out
+*.toc
+*.tex
+figure/
+
+# Source/reference PDFs not produced by this repository
+sinkhorm.pdf

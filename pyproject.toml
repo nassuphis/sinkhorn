@@ -1,0 +1,11 @@
+[project]
+name = "sinkhorn-demo"
+version = "0.1.0"
+description = "Tiny NumPy benchmark comparing exact assignment and Sinkhorn transport."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,837 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{Hungarian Assignment and Sinkhorn Transport for Root Tracking}
+\author{Benchmark and conclusions report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+<<setup, include=FALSE>>=
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+
+fmt <- function(x, digits = 4) {
+  if (is.numeric(x)) {
+    return(formatC(x, digits = digits, format = "fg", flag = "#"))
+  }
+  x
+}
+
+hungarian <- function(cost) {
+  n <- nrow(cost)
+  m <- ncol(cost)
+  if (n != m) stop("hungarian expects a square cost matrix")
+
+  u <- numeric(n)
+  v <- numeric(m + 1)
+  p <- integer(m + 1)
+  way <- integer(m + 1)
+
+  for (i in seq_len(n)) {
+    p[1] <- i
+    j0 <- 1
+    minv <- rep(Inf, m + 1)
+    used <- rep(FALSE, m + 1)
+
+    repeat {
+      used[j0] <- TRUE
+      i0 <- p[j0]
+      delta <- Inf
+      j1 <- 1
+
+      for (j in 2:(m + 1)) {
+        if (!used[j]) {
+          current <- cost[i0, j - 1] - u[i0] - v[j]
+          if (current < minv[j]) {
+            minv[j] <- current
+            way[j] <- j0
+          }
+          if (minv[j] < delta) {
+            delta <- minv[j]
+            j1 <- j
+          }
+        }
+      }
+
+      for (j in seq_len(m + 1)) {
+        if (used[j]) {
+          if (p[j] != 0) u[p[j]] <- u[p[j]] + delta
+          v[j] <- v[j] - delta
+        } else {
+          minv[j] <- minv[j] - delta
+        }
+      }
+
+      j0 <- j1
+      if (p[j0] == 0) break
+    }
+
+    repeat {
+      j1 <- way[j0]
+      p[j0] <- p[j1]
+      j0 <- j1
+      if (j0 == 1) break
+    }
+  }
+
+  perm <- integer(n)
+  for (j in 2:(m + 1)) {
+    if (p[j] != 0) perm[p[j]] <- j - 1
+  }
+  perm
+}
+
+sinkhorn_primal <- function(cost, epsilon, iterations = 20) {
+  n <- nrow(cost)
+  a <- rep(1 / n, n)
+  b <- rep(1 / n, n)
+  K <- exp(-cost / epsilon)
+  tiny <- .Machine$double.xmin
+  u <- rep(1, n)
+  v <- rep(1, n)
+
+  for (step in seq_len(iterations)) {
+    u <- as.vector(a / pmax(K %*% v, tiny))
+    v <- as.vector(b / pmax(t(K) %*% u, tiny))
+  }
+
+  P <- sweep(K, 1, u, "*")
+  P <- sweep(P, 2, v, "*")
+  list(
+    plan = P,
+    cost = sum(P * cost),
+    row_error = max(abs(rowSums(P) - a)),
+    col_error = max(abs(colSums(P) - b))
+  )
+}
+
+assignment_matrix <- function(perm) {
+  n <- length(perm)
+  A <- matrix(0, n, n)
+  A[cbind(seq_len(n), perm)] <- 1
+  A
+}
+
+assignment_metrics <- function(exact_perm, P) {
+  n <- nrow(P)
+  S <- n * P
+  A <- assignment_matrix(exact_perm)
+  row_argmax <- max.col(S, ties.method = "first")
+  top <- apply(S, 1, max)
+  second <- apply(S, 1, function(row) sort(row, decreasing = TRUE)[2])
+  overlap <- sum(P[cbind(seq_len(n), exact_perm)])
+  list(
+    row_argmax = row_argmax,
+    overlap = overlap,
+    assign_error = sum(abs(A - S)) / (2 * n),
+    unique_cols = length(unique(row_argmax)),
+    mean_top = mean(top),
+    min_top = min(top),
+    mean_margin = mean(top - second)
+  )
+}
+
+root_cost <- function(old, new) {
+  abs(outer(old, new, "-"))^2
+}
+
+synthetic_roots <- function(degree = 50, seed = 123, jitter = 0.05, step = 0.015) {
+  set.seed(seed)
+  angles <- 2 * pi * (0:(degree - 1)) / degree
+  old <- exp(1i * angles) + jitter * (rnorm(degree) + 1i * rnorm(degree))
+  new_unshuffled <- old + step * (rnorm(degree) + 1i * rnorm(degree))
+  shuffle <- sample.int(degree)
+  new <- new_unshuffled[shuffle]
+
+  true_perm <- integer(degree)
+  for (new_col in seq_along(shuffle)) {
+    true_perm[shuffle[new_col]] <- new_col
+  }
+
+  list(old = old, new = new, true_perm = true_perm)
+}
+
+time_mean_ms <- function(fn, reps = 30) {
+  result <- NULL
+  t0 <- proc.time()[["elapsed"]]
+  for (rep in seq_len(reps)) {
+    result <- fn()
+  }
+  list(
+    result = result,
+    ms = 1000 * (proc.time()[["elapsed"]] - t0) / reps
+  )
+}
+
+run_root_case <- function(step, iterations = 20, degree = 50, seed = 123, timing_reps = 30) {
+  data <- synthetic_roots(degree = degree, seed = seed, step = step)
+  cost <- root_cost(data$old, data$new)
+
+  timed_hungarian <- time_mean_ms(function() hungarian(cost), reps = timing_reps)
+  hperm <- timed_hungarian$result
+  hungarian_ms <- timed_hungarian$ms
+  hcost <- mean(cost[cbind(seq_len(degree), hperm)])
+
+  sorted_cost <- t(apply(cost, 1, sort))
+  median_gap <- median(sorted_cost[, 2] - sorted_cost[, 1])
+  scales <- c(1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
+
+  rows <- lapply(scales, function(scale) {
+    epsilon <- scale * median_gap
+    timed_sinkhorn <- time_mean_ms(
+      function() sinkhorn_primal(cost, epsilon, iterations = iterations),
+      reps = timing_reps
+    )
+    sh <- timed_sinkhorn$result
+    sink_ms <- timed_sinkhorn$ms
+    met <- assignment_metrics(hperm, sh$plan)
+    data.frame(
+      scale = scale,
+      epsilon = epsilon,
+      sink_ms = sink_ms,
+      argmax_hungarian = mean(met$row_argmax == hperm),
+      argmax_true = mean(met$row_argmax == data$true_perm),
+      unique_cols = met$unique_cols,
+      assign_error = met$assign_error,
+      mean_top = met$mean_top,
+      min_top = met$min_top,
+      mean_margin = met$mean_margin,
+      row_error = sh$row_error
+    )
+  })
+
+  list(
+    data = data,
+    cost = cost,
+    hperm = hperm,
+    hcost = hcost,
+    hungarian_ms = hungarian_ms,
+    hungarian_true_accuracy = mean(hperm == data$true_perm),
+    median_gap = median_gap,
+    table = do.call(rbind, rows)
+  )
+}
+
+plot_tracking <- function(old, new, perm, title, cols) {
+  x <- c(Re(old), Re(new))
+  y <- c(Im(old), Im(new))
+  plot(
+    x, y,
+    type = "n",
+    asp = 1,
+    xlab = "",
+    ylab = "",
+    main = title
+  )
+  abline(h = 0, v = 0, col = "gray90")
+  symbols(0, 0, circles = 1, inches = FALSE, add = TRUE, fg = "gray90")
+
+  for (i in seq_along(old)) {
+    j <- perm[i]
+    segments(
+      Re(old[i]), Im(old[i]),
+      Re(new[j]), Im(new[j]),
+      col = adjustcolor(cols[i], alpha.f = 0.38),
+      lwd = 1.2
+    )
+  }
+
+  points(Re(old), Im(old), pch = 16, col = cols, cex = 0.95)
+  points(Re(new[perm]), Im(new[perm]), pch = 4, col = cols, cex = 1.15, lwd = 1.2)
+  legend(
+    "topright",
+    legend = c("old root", "assigned new root"),
+    pch = c(16, 4),
+    col = "black",
+    bty = "n",
+    cex = 0.75
+  )
+}
+
+degree <- 50
+easy <- run_root_case(step = 0.015, iterations = 20, degree = degree, seed = 123)
+hard <- run_root_case(step = 0.08, iterations = 20, degree = degree, seed = 123)
+cols <- rainbow(degree)
+
+easy_scale <- 0.02
+easy_eps <- easy_scale * easy$median_gap
+easy_sink <- sinkhorn_primal(easy$cost, easy_eps, iterations = 20)
+easy_sink_perm <- assignment_metrics(easy$hperm, easy_sink$plan)$row_argmax
+
+hard_scale <- 0.02
+hard_eps <- hard_scale * hard$median_gap
+hard_sink <- sinkhorn_primal(hard$cost, hard_eps, iterations = 20)
+hard_sink_perm <- assignment_metrics(hard$hperm, hard_sink$plan)$row_argmax
+@
+
+\section*{Executive Summary}
+
+This report evaluates whether entropic Sinkhorn transport can replace or
+accelerate Hungarian assignment for tracking polynomial roots across a parameter
+step. The distinction between the two algorithms is essential. Hungarian returns
+an exact one-to-one assignment. Sinkhorn returns a soft transport matrix whose
+row and column sums are correct, but whose entries are continuous rather than
+binary.
+
+The conclusions are:
+
+\begin{itemize}
+\item Sinkhorn is attractive when a soft transport cost, confidence matrix, or
+proposal assignment is acceptable.
+\item Sinkhorn is not automatically a faster way to compute the exact Hungarian
+permutation. Making the soft matrix close to a hard assignment can require very
+small \(\epsilon\), log-domain stabilization, and more iterations.
+\item Parallel Sinkhorn scales well in C because each iteration is dominated by
+matrix-vector work. This advantage is clearest for large matrices and for
+difficult or tie-heavy assignment instances.
+\item For degree-50 root tracking, a compiled Hungarian solver is already fast.
+Sinkhorn is best used as a confidence-scored proposal for easy continuation
+steps, with Hungarian as the fallback when confidence checks fail.
+\end{itemize}
+
+\section*{Problem Setup}
+
+At one parameter value there are old roots \(z_i^{\mathrm{old}}\). At the next
+parameter value there are new roots \(z_j^{\mathrm{new}}\). A common tracking
+cost is the squared distance
+
+\[
+C_{ij}=|z_i^{\mathrm{old}}-z_j^{\mathrm{new}}|^2.
+\]
+
+The hard assignment problem asks for a permutation \(\pi\) minimizing
+
+\[
+\sum_{i=1}^n C_{i,\pi(i)}.
+\]
+
+The Hungarian algorithm solves this problem exactly and returns a permutation
+matrix \(A\):
+
+\[
+\sum_j A_{ij}=1,\quad \sum_i A_{ij}=1,\quad A_{ij}\in\{0,1\}.
+\]
+
+Sinkhorn instead solves an entropy-regularized transport problem. With uniform
+marginals, the transport matrix \(P\) has row and column sums \(1/n\). Scaling
+by \(n\) gives the soft assignment matrix
+
+\[
+S = nP,\quad \sum_j S_{ij}=1,\quad \sum_i S_{ij}=1.
+\]
+
+The regularization parameter \(\epsilon\) controls the softness. Large
+\(\epsilon\) spreads mass over many possible matches. Small \(\epsilon\)
+concentrates mass on low-cost matches and can approach a hard assignment.
+
+\section*{Comparison Metrics}
+
+The assignment-matrix error is the normalized \(L^1\) distance between the hard
+Hungarian matrix \(A\) and the scaled Sinkhorn matrix \(S\):
+
+\[
+\mathrm{assign\_err}(A,S)=\frac{1}{2n}\sum_{ij}|A_{ij}-S_{ij}|.
+\]
+
+This metric is \(0\) when the matrices are identical and is close to \(1\) when
+the Sinkhorn matrix places little mass on the Hungarian assignment.
+
+For root tracking, row-wise argmax agreement is often more useful than full
+matrix error. The Sinkhorn proposal is
+
+\[
+\hat\pi(i)=\arg\max_j S_{ij}.
+\]
+
+If every row chooses the Hungarian column and the chosen columns are unique, then
+Sinkhorn proposes the same permutation even when the full soft matrix still has
+some off-diagonal mass. Confidence is measured by the largest row entry
+(``top mass'') and by the top-vs-second gap.
+
+\section*{Soft Transport Versus Hard Assignment}
+
+The following \(n=200\) benchmark uses random one-dimensional point sets and
+compares a simple Sinkhorn run with a hard Hungarian assignment. It illustrates a
+central tradeoff: Sinkhorn can compute a soft transport plan quickly while still
+being far from the hard assignment matrix.
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{rrrrrrrr}
+\hline
+\(\epsilon\) & Hungarian ms & Sinkhorn ms & speedup & Sinkhorn cost & abs. cost err & assignment overlap & assignment err \\
+\hline
+0.5  & 842.157 & 0.618 & 1362.7 & 0.115116 & 0.113980 & 0.006740 & 0.993260 \\
+0.1  & 842.157 & 0.762 & 1105.2 & 0.039495 & 0.038358 & 0.011580 & 0.988420 \\
+0.02 & 842.157 & 2.417 & 348.4  & 0.009973 & 0.008836 & 0.022382 & 0.977618 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+The timing advantage in this table is attached to a poor hard-assignment match:
+assignment error remains above \(0.97\) for all three \(\epsilon\) values. On
+this cost scale, reducing assignment error below \(0.1\) requires log-domain
+Sinkhorn with epsilon scaling and \(\epsilon\) around \(2\cdot 10^{-7}\). That
+sharper computation gives up most of the simple Sinkhorn speed advantage.
+
+\section*{Parallel C Sinkhorn}
+
+Sinkhorn's key computational advantage is that each iteration is built from
+matrix-vector operations. Those row and column scaling passes can be split across
+threads. Hungarian assignment is much harder to parallelize because it is an
+augmenting-path combinatorial algorithm with sequential dependencies.
+
+The C benchmark compares a serial shortest-augmenting-path Hungarian solver with
+a pthread-parallel Sinkhorn solver called from Python through \texttt{ctypes}.
+The benchmark uses three cost families:
+
+\begin{itemize}
+\item \texttt{sorted-1d}: squared distances between sorted random points;
+\item \texttt{dense}: an unstructured random cost matrix;
+\item \texttt{flat}: an all-zero tie-heavy matrix that exposes difficult
+augmenting-path behavior.
+\end{itemize}
+
+The Sinkhorn runs use fixed 200 iterations at \(\epsilon=0.02\). The C Sinkhorn
+timing includes building \(K=\exp(-C/\epsilon)\), iterating, and computing final
+errors.
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\hline
+cost kind & \(n\) & C Hungarian ms & Sinkhorn 1 thread ms & Sinkhorn 8 thread ms & 8 thread / 1 thread & speedup vs Hungarian \\
+\hline
+sorted-1d & 1000 & 342.561   & 314.881  & 54.318   & 5.80 & 6.31 \\
+sorted-1d & 2000 & 1073.838  & 1370.680 & 206.903  & 6.62 & 5.19 \\
+sorted-1d & 3000 & 1389.212  & 3168.630 & 477.274  & 6.64 & 2.91 \\
+sorted-1d & 4000 & 6651.321  & 8867.463 & 1318.831 & 6.72 & 5.04 \\
+dense     & 1000 & 40.245    & 336.414  & 61.073   & 5.51 & 0.66 \\
+dense     & 2000 & 204.245   & 1403.717 & 222.992  & 6.29 & 0.92 \\
+dense     & 3000 & 552.399   & 3329.158 & 490.290  & 6.79 & 1.13 \\
+dense     & 4000 & 1168.892  & 8865.697 & 1304.035 & 6.80 & 0.90 \\
+flat      & 1000 & 442.498   & 339.049  & 63.596   & 5.33 & 6.96 \\
+flat      & 2000 & 3450.115  & 1434.381 & 228.826  & 6.27 & 15.08 \\
+flat      & 3000 & 11335.831 & 3351.490 & 490.957  & 6.83 & 23.09 \\
+flat      & 4000 & 27887.982 & 9553.088 & 1315.460 & 7.26 & 21.20 \\
+\hline
+\end{tabular}
+}
+\end{center}
+
+The data separate three cases. The \texttt{sorted-1d} distance matrices are
+structured, and the dense random matrices do not reliably trigger worst-case
+Hungarian behavior. The \texttt{flat} tie-heavy matrices do: C Hungarian grows
+from \(0.44\) seconds at \(n=1000\) to \(27.9\) seconds at \(n=4000\), while
+8-thread Sinkhorn grows from \(64\) ms to \(1.32\) seconds. The practical
+conclusion is conditional. Sinkhorn's parallelism is valuable for large soft
+transport problems and for difficult assignment instances, but for exact
+degree-50 root tracking, compiled Hungarian remains a strong baseline.
+
+\section*{Root Tracking Experiment}
+
+The synthetic root experiment creates 50 complex roots near the unit circle, then
+moves them by a small random amount and shuffles the new roots. This mimics the
+problem of re-indexing roots after a parameter step.
+
+\subsection*{Easy Case: Small Parameter Step}
+
+The small-step case uses root motion scale \(0.015\). Hungarian matches the known
+synthetic identity perfectly in this case.
+
+<<easy-table, results='asis'>>=
+easy_table <- easy$table
+easy_show <- data.frame(
+  scale = easy_table$scale,
+  epsilon = signif(easy_table$epsilon, 4),
+  sink_ms = round(easy_table$sink_ms, 3),
+  argmax_hungarian = round(easy_table$argmax_hungarian, 3),
+  argmax_true = round(easy_table$argmax_true, 3),
+  unique_cols = easy_table$unique_cols,
+  assign_error = round(easy_table$assign_error, 6),
+  mean_top = round(easy_table$mean_top, 4),
+  min_top = round(easy_table$min_top, 4)
+)
+cat(
+  paste0(
+    "\\noindent Easy degree-50 root tracking. Hungarian time = ",
+    round(easy$hungarian_ms, 3),
+    " ms; Hungarian vs known truth = ",
+    round(easy$hungarian_true_accuracy, 3),
+    ".\\par\\smallskip\n"
+  )
+)
+cat("\\begin{center}\\resizebox{\\textwidth}{!}{%\n")
+cat(knitr::kable(
+  easy_show,
+  format = "latex"
+))
+cat("\n}\\end{center}\n")
+@
+
+\subsection*{Harder Case: Larger Parameter Step}
+
+The harder case uses root motion scale \(0.08\). Here the nearest-root assignment
+itself starts to differ from the known synthetic identity. This is the regime
+where the parameter step may be too large, roots may be close, and assignment
+confidence matters.
+
+<<hard-table, results='asis'>>=
+hard_table <- hard$table
+hard_show <- data.frame(
+  scale = hard_table$scale,
+  epsilon = signif(hard_table$epsilon, 4),
+  sink_ms = round(hard_table$sink_ms, 3),
+  argmax_hungarian = round(hard_table$argmax_hungarian, 3),
+  argmax_true = round(hard_table$argmax_true, 3),
+  unique_cols = hard_table$unique_cols,
+  assign_error = round(hard_table$assign_error, 6),
+  mean_top = round(hard_table$mean_top, 4),
+  min_top = round(hard_table$min_top, 4)
+)
+cat(
+  paste0(
+    "\\noindent Harder degree-50 root tracking. Hungarian time = ",
+    round(hard$hungarian_ms, 3),
+    " ms; Hungarian vs known truth = ",
+    round(hard$hungarian_true_accuracy, 3),
+    ".\\par\\smallskip\n"
+  )
+)
+cat("\\begin{center}\\resizebox{\\textwidth}{!}{%\n")
+cat(knitr::kable(
+  hard_show,
+  format = "latex"
+))
+cat("\n}\\end{center}\n")
+@
+
+\section*{Root-Tracking Timing}
+
+The root-tracking tables report Sinkhorn runtime per \(\epsilon\). The timing
+table in this section puts the Hungarian and Sinkhorn runtimes side by side. The
+speed ratio is
+
+\[
+\mathrm{speedup}=\frac{\mathrm{Hungarian\ ms}}{\mathrm{Sinkhorn\ ms}}.
+\]
+
+Values greater than \(1\) mean Sinkhorn was faster for that row.
+
+<<timing-table, results='asis'>>=
+timing_show <- rbind(
+  data.frame(
+    case = "easy",
+    scale = easy$table$scale,
+    epsilon = signif(easy$table$epsilon, 4),
+    hung_ms = round(easy$hungarian_ms, 3),
+    sink_ms = round(easy$table$sink_ms, 3),
+    speedup = round(easy$hungarian_ms / easy$table$sink_ms, 2),
+    argmax_hungarian = round(easy$table$argmax_hungarian, 3),
+    unique_cols = easy$table$unique_cols
+  ),
+  data.frame(
+    case = "harder",
+    scale = hard$table$scale,
+    epsilon = signif(hard$table$epsilon, 4),
+    hung_ms = round(hard$hungarian_ms, 3),
+    sink_ms = round(hard$table$sink_ms, 3),
+    speedup = round(hard$hungarian_ms / hard$table$sink_ms, 2),
+    argmax_hungarian = round(hard$table$argmax_hungarian, 3),
+    unique_cols = hard$table$unique_cols
+  )
+)
+
+cat("\\begin{center}\\resizebox{\\textwidth}{!}{%\n")
+cat(knitr::kable(
+  timing_show,
+  format = "latex"
+))
+cat("\n}\\end{center}\n")
+@
+
+\clearpage
+\section*{Root-Tracking Plots}
+
+Each old root has a fixed rainbow color. The assigned new root is drawn with the
+same color and connected by a segment. Effective tracking produces short,
+coherent segments with no obvious crossings or duplicate targets.
+
+<<root-plots, fig.width=7.2, fig.height=6.8, out.width='\\textwidth'>>=
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(2, 2), mar = c(3.2, 3.2, 3.0, 1.0))
+
+plot_tracking(
+  easy$data$old,
+  easy$data$new,
+  easy$hperm,
+  "Easy: Hungarian assignment",
+  cols
+)
+
+plot_tracking(
+  easy$data$old,
+  easy$data$new,
+  easy_sink_perm,
+  paste0("Easy: Sinkhorn row argmax, scale ", easy_scale),
+  cols
+)
+
+plot_tracking(
+  hard$data$old,
+  hard$data$new,
+  hard$hperm,
+  "Harder: Hungarian assignment",
+  cols
+)
+
+plot_tracking(
+  hard$data$old,
+  hard$data$new,
+  hard_sink_perm,
+  paste0("Harder: Sinkhorn row argmax, scale ", hard_scale),
+  cols
+)
+
+par(old_par)
+@
+
+\section*{Error and Confidence Curves}
+
+These curves show that decreasing \(\epsilon\) sharpens the Sinkhorn matrix. In
+the easy case, the row argmax agrees with Hungarian across the sweep. In the
+harder case, duplicate columns and low-confidence rows appear.
+
+<<curves, fig.width=7.2, fig.height=4.2, out.width='\\textwidth'>>=
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(1, 2), mar = c(4.2, 4.2, 2.8, 1.0))
+
+plot(
+  easy$table$scale,
+  easy$table$assign_error,
+  type = "b",
+  log = "x",
+  pch = 16,
+  col = "dodgerblue3",
+  ylim = range(c(easy$table$assign_error, hard$table$assign_error)),
+  xlab = "epsilon scale, log axis",
+  ylab = "assignment error",
+  main = "Matrix error"
+)
+lines(hard$table$scale, hard$table$assign_error, type = "b", pch = 16, col = "firebrick3")
+legend("topleft", legend = c("easy", "harder"), col = c("dodgerblue3", "firebrick3"), lwd = 2, pch = 16, bty = "n")
+
+plot(
+  easy$table$scale,
+  easy$table$min_top,
+  type = "b",
+  log = "x",
+  pch = 16,
+  col = "dodgerblue3",
+  ylim = c(0, 1),
+  xlab = "epsilon scale, log axis",
+  ylab = "minimum row top mass",
+  main = "Worst-row confidence"
+)
+lines(hard$table$scale, hard$table$min_top, type = "b", pch = 16, col = "firebrick3")
+abline(h = 0.8, col = "gray60", lty = 2)
+legend("bottomleft", legend = c("easy", "harder", "0.8 threshold"), col = c("dodgerblue3", "firebrick3", "gray60"), lwd = 2, pch = c(16, 16, NA), lty = c(1, 1, 2), bty = "n")
+
+par(old_par)
+@
+
+\section*{Recommendation}
+
+For degree-50 root tracking, Sinkhorn can be useful if the roots move in small
+steps and remain well separated. In the easy synthetic case, 20 primal Sinkhorn
+iterations were enough for the row argmax to match Hungarian exactly, and the
+runtime was lower than the R Hungarian timing in the root-tracking table.
+
+The safe workflow is:
+
+\begin{enumerate}
+\item Build the squared-distance cost matrix between old and new complex roots.
+\item Choose \(\epsilon\) as a fraction of the median nearest-vs-second-nearest
+cost gap.
+\item Run a small fixed number of Sinkhorn iterations.
+\item Convert \(P\) to \(S=nP\), take row argmax, and check uniqueness,
+top mass, and top-vs-second margin.
+\item If checks pass, use the Sinkhorn proposal.
+\item If checks fail, fall back to Hungarian or reduce the parameter step.
+\end{enumerate}
+
+The confidence checks are:
+  \begin{itemize}
+  \item all chosen columns are unique;
+  \item every row has high top mass;
+  \item the top-vs-second margin is large.
+  \end{itemize}
+
+If exact one-to-one assignment is required with no fallback, Hungarian remains
+the correct algorithm. Sinkhorn is best viewed as a fast, confidence-scored
+proposal for easy continuation steps.
+
+\clearpage
+\appendix
+
+\section{Hungarian Algorithm}
+
+The Hungarian algorithm solves the square linear assignment problem
+
+\[
+\min_{\pi}\sum_{i=1}^n C_{i,\pi(i)},
+\]
+
+where \(C_{ij}\) is the cost of assigning old item \(i\) to new item \(j\), and
+\(\pi\) is a permutation. In root tracking, \(C_{ij}\) is usually
+
+\[
+C_{ij}=|z_i^{\mathrm{old}}-z_j^{\mathrm{new}}|^2.
+\]
+
+The output is a hard permutation matrix \(A\), where
+
+\[
+A_{ij} =
+\begin{cases}
+1, & j=\pi(i),\\
+0, & \text{otherwise}.
+\end{cases}
+\]
+
+Every row and every column sums to one. This is exactly the structure needed
+when each old root must be paired with exactly one new root and no new root can
+be reused.
+
+\subsection*{Dual View}
+
+The benchmark uses the standard shortest-augmenting-path form of the Hungarian
+algorithm. It maintains dual variables \(u_i\) and \(v_j\)
+such that reduced costs
+
+\[
+\tilde C_{ij}=C_{ij}-u_i-v_j
+\]
+
+remain nonnegative on the current equality graph. The algorithm repeatedly adds
+one row to the matching. For that row, it searches for a cheapest augmenting path
+through columns using the reduced costs, updates the dual variables, and flips
+the matching along the path.
+
+\subsection*{Properties}
+
+\begin{itemize}
+\item It returns the exact minimum-cost one-to-one assignment.
+\item Its usual complexity is \(O(n^3)\).
+\item It gives a hard permutation, not a soft confidence matrix.
+\item For degree \(50\), the cost matrix is only \(50\times 50\), so a good
+compiled Hungarian solver is usually very fast.
+\end{itemize}
+
+\subsection*{Relevance To Root Tracking}
+
+Hungarian is the right method when the required output is a guaranteed
+one-to-one mapping. Its weakness is that it only uses the cost matrix at the
+current parameter step. If roots are close, collide, or pass near a branch point,
+the nearest-root assignment can itself become a poor proxy for analytic
+continuation. In that case, the real fix is often a smaller parameter step or
+additional continuation information, not a different assignment algorithm.
+
+\section{Sinkhorn Algorithm}
+
+Sinkhorn solves an entropy-regularized version of optimal transport. Given a
+cost matrix \(C\), uniform marginals \(a=b=(1/n,\dots,1/n)\), and a positive
+regularization scale \(\epsilon\), define the Gibbs kernel
+
+\[
+K_{ij}=\exp(-C_{ij}/\epsilon).
+\]
+
+The Sinkhorn algorithm alternates row and column scaling:
+
+\[
+u \leftarrow \frac{a}{Kv}, \qquad
+v \leftarrow \frac{b}{K^\top u}.
+\]
+
+After iteration, the transport plan is
+
+\[
+P = \mathrm{diag}(u)K\mathrm{diag}(v).
+\]
+
+This plan has approximately the desired row and column sums:
+
+\[
+P\mathbf{1}\approx a,\qquad P^\top\mathbf{1}\approx b.
+\]
+
+For assignment-style comparison, this report scales \(P\) into
+
+\[
+S=nP.
+\]
+
+Then \(S\) is a soft doubly-stochastic assignment matrix: every row and column
+sums to approximately one, but entries are continuous rather than binary.
+
+\subsection*{Role Of \(\epsilon\)}
+
+The parameter \(\epsilon\) controls how soft the plan is:
+
+\begin{itemize}
+\item Large \(\epsilon\): \(K\) is diffuse, and \(P\) spreads mass across many
+columns.
+\item Small \(\epsilon\): \(K\) concentrates on low-cost entries, and \(P\)
+approaches a hard assignment.
+\end{itemize}
+
+This is why Sinkhorn can be useful for confidence scoring. A row with one very
+large entry and a large top-vs-second margin is an easy match. A row with several
+similar entries is ambiguous.
+
+\subsection*{Numerical Stability}
+
+For very small \(\epsilon\), the entries of \(K=\exp(-C/\epsilon)\) can underflow
+to zero. The stable alternative is log-domain Sinkhorn, which stores the scaling
+as dual potentials and uses log-sum-exp operations. Epsilon scaling is another
+standard stabilization strategy: solve an easier large-\(\epsilon\) problem
+first, then warm-start smaller \(\epsilon\) values.
+
+\subsection*{Properties}
+
+\begin{itemize}
+\item Each iteration is mostly matrix-vector multiplication and is easy to
+vectorize.
+\item It produces a soft transport plan, not a guaranteed permutation.
+\item It is useful when a soft cost or confidence matrix is acceptable.
+\item To recover a hard Hungarian-like assignment matrix, \(\epsilon\) must be
+very small; at that point the method can require log-domain stabilization and
+many iterations.
+\end{itemize}
+
+\subsection*{Relevance To Root Tracking}
+
+For root tracking, Sinkhorn can be used as a fast proposal:
+
+\[
+\hat\pi(i)=\arg\max_j S_{ij}.
+\]
+
+This proposal is usable when all selected columns are unique and every row is
+confident. If any column is selected twice, if a row has low top mass, or if the
+top-vs-second margin is small, then the step should fall back to Hungarian or
+the parameter step should be reduced.
+
+\end{document}
