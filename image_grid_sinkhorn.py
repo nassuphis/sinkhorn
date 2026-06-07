@@ -296,6 +296,123 @@ def greedy_round(
     return assigned, assigned_score, assigned_cost, margin
 
 
+def recursive_sinkhorn_round(
+    plan: np.ndarray,
+    cost: np.ndarray,
+    image_count: int,
+    seed: int,
+    epsilon: float,
+    iterations: int,
+    tol: float,
+    max_rounds: int,
+    candidates_per_image: int,
+    repair_epsilon_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    rng = np.random.default_rng(seed)
+    scores = plan[:image_count, :].copy()
+    scores += rng.random(scores.shape) * 1e-12
+
+    sorted_scores = np.sort(scores, axis=1)
+    top = sorted_scores[:, -1]
+    second = sorted_scores[:, -2] if scores.shape[1] >= 2 else np.zeros(image_count)
+    margin = top - second
+
+    assigned = np.argmax(scores, axis=1).astype(int)
+    cell_count = scores.shape[1]
+    counts = np.bincount(assigned, minlength=cell_count)
+    stats = {
+        "initial_duplicate_cells": int(np.sum(counts > 1)),
+        "initial_conflicted_images": int(np.sum(counts[assigned] > 1)),
+        "repair_rounds": 0,
+        "local_repairs": 0,
+        "argmax_duplicate_rounds": 0,
+        "final_hungarian_fallbacks": 0,
+        "max_local_images": 0,
+        "max_local_cells": 0,
+    }
+    repair_scale = repair_epsilon_scale if repair_epsilon_scale > 0 else 1.0
+
+    for repair_round in range(1, max_rounds + 1):
+        counts = np.bincount(assigned, minlength=cell_count)
+        duplicate_cells = np.flatnonzero(counts > 1)
+        if duplicate_cells.size == 0:
+            break
+
+        repair_images = np.flatnonzero(np.isin(assigned, duplicate_cells))
+        stable = np.ones(image_count, dtype=bool)
+        stable[repair_images] = False
+
+        locked_cells = np.zeros(cell_count, dtype=bool)
+        locked_cells[assigned[stable]] = True
+        available_cells = np.flatnonzero(~locked_cells)
+        available_mask = np.zeros(cell_count, dtype=bool)
+        available_mask[available_cells] = True
+
+        candidate_mask = np.zeros(cell_count, dtype=bool)
+        candidate_mask[duplicate_cells] = True
+
+        if candidates_per_image > 0 and available_cells.size > 0:
+            top_count = min(candidates_per_image, available_cells.size)
+            available_scores = scores[np.ix_(repair_images, available_cells)]
+            for row_scores in available_scores:
+                top_local = np.argsort(row_scores)[-top_count:]
+                candidate_mask[available_cells[top_local]] = True
+
+        candidate_mask &= available_mask
+        if int(np.sum(candidate_mask)) < repair_images.size:
+            aggregate = np.max(scores[np.ix_(repair_images, available_cells)], axis=0)
+            for local_idx in np.argsort(aggregate)[::-1]:
+                candidate_mask[available_cells[local_idx]] = True
+                if int(np.sum(candidate_mask)) >= repair_images.size:
+                    break
+
+        candidate_cells = np.flatnonzero(candidate_mask)
+        if candidate_cells.size < repair_images.size:
+            candidate_cells = available_cells
+
+        local_cost = cost[np.ix_(repair_images, candidate_cells)]
+        repair_epsilon = max(epsilon * (repair_scale ** repair_round), 1e-8)
+        local_plan, _, _, _ = sinkhorn_log(
+            augment_cost(local_cost, candidate_cells.size),
+            epsilon=repair_epsilon,
+            iterations=iterations,
+            tol=tol,
+        )
+        local_scores = local_plan[:repair_images.size, :].copy()
+        local_scores += rng.random(local_scores.shape) * 1e-12
+        proposed = candidate_cells[np.argmax(local_scores, axis=1)]
+
+        if np.unique(proposed).size < proposed.size:
+            stats["argmax_duplicate_rounds"] += 1
+
+        assigned[repair_images] = proposed
+        stats["repair_rounds"] = repair_round
+        stats["local_repairs"] += 1
+        stats["max_local_images"] = max(stats["max_local_images"], int(repair_images.size))
+        stats["max_local_cells"] = max(stats["max_local_cells"], int(candidate_cells.size))
+
+    counts = np.bincount(assigned, minlength=cell_count)
+    if np.any(counts > 1):
+        duplicate_cells = np.flatnonzero(counts > 1)
+        repair_images = np.flatnonzero(np.isin(assigned, duplicate_cells))
+        stable = np.ones(image_count, dtype=bool)
+        stable[repair_images] = False
+        locked_cells = np.zeros(cell_count, dtype=bool)
+        locked_cells[assigned[stable]] = True
+        candidate_cells = np.flatnonzero(~locked_cells)
+        local_cost = cost[np.ix_(repair_images, candidate_cells)]
+        local_assigned, _ = hungarian_assign(local_cost)
+        assigned[repair_images] = candidate_cells[local_assigned]
+        stats["final_hungarian_fallbacks"] += 1
+        stats["local_repairs"] += 1
+        stats["max_local_images"] = max(stats["max_local_images"], int(repair_images.size))
+        stats["max_local_cells"] = max(stats["max_local_cells"], int(candidate_cells.size))
+
+    assigned_score = plan[np.arange(image_count), assigned]
+    assigned_cost = cost[np.arange(image_count), assigned]
+    return assigned, assigned_score, assigned_cost, margin, stats
+
+
 def hungarian_assign(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     row_ind, col_ind = linear_sum_assignment(cost)
     assigned = np.full(cost.shape[0], -1, dtype=int)
@@ -605,6 +722,30 @@ def main() -> None:
     parser.add_argument("--sinkhorn-tol", type=float, default=1e-8)
     parser.add_argument("--epsilon", type=float, default=None)
     parser.add_argument("--epsilon-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--rounding",
+        choices=("greedy", "recursive-sinkhorn"),
+        default="greedy",
+        help="How to turn the soft Sinkhorn plan into a one-image-per-cell layout.",
+    )
+    parser.add_argument(
+        "--repair-rounds",
+        type=int,
+        default=6,
+        help="Maximum duplicate-repair rounds for recursive Sinkhorn rounding.",
+    )
+    parser.add_argument(
+        "--repair-candidates",
+        type=int,
+        default=12,
+        help="Top available cells per conflicted image in each repair subproblem.",
+    )
+    parser.add_argument(
+        "--repair-epsilon-scale",
+        type=float,
+        default=0.5,
+        help="Multiplier applied to epsilon for local recursive Sinkhorn repairs.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
@@ -668,17 +809,45 @@ def main() -> None:
         f"{used_iterations}, row_err = {row_error:.2e}, col_err = {col_error:.2e}"
     )
 
-    assigned, assigned_score, assigned_cost, top_margin = greedy_round(
-        plan,
-        cost,
-        image_count=len(loaded),
-        seed=args.seed,
-    )
+    repair_stats: dict[str, int] | None = None
+    if args.rounding == "greedy":
+        assigned, assigned_score, assigned_cost, top_margin = greedy_round(
+            plan,
+            cost,
+            image_count=len(loaded),
+            seed=args.seed,
+        )
+    else:
+        assigned, assigned_score, assigned_cost, top_margin, repair_stats = (
+            recursive_sinkhorn_round(
+                plan,
+                cost,
+                image_count=len(loaded),
+                seed=args.seed,
+                epsilon=epsilon,
+                iterations=args.sinkhorn_iterations,
+                tol=args.sinkhorn_tol,
+                max_rounds=args.repair_rounds,
+                candidates_per_image=args.repair_candidates,
+                repair_epsilon_scale=args.repair_epsilon_scale,
+            )
+        )
     free_cells = rows * cols - len(np.unique(assigned))
     print(
-        f"rounded assignment: {len(loaded)} images, "
+        f"{args.rounding} assignment: {len(loaded)} images, "
         f"{free_cells} blank cells, mean cost = {assigned_cost.mean():.6g}"
     )
+    if repair_stats is not None:
+        print(
+            "recursive repair: "
+            f"initial duplicate cells = {repair_stats['initial_duplicate_cells']}, "
+            f"conflicted images = {repair_stats['initial_conflicted_images']}, "
+            f"repair rounds = {repair_stats['repair_rounds']}, "
+            f"max local problem = {repair_stats['max_local_images']} x "
+            f"{repair_stats['max_local_cells']}, "
+            f"duplicate argmax rounds = {repair_stats['argmax_duplicate_rounds']}, "
+            f"final Hungarian fallbacks = {repair_stats['final_hungarian_fallbacks']}"
+        )
     print(
         f"confidence: mean assigned score = {assigned_score.mean():.6g}, "
         f"mean margin = {top_margin.mean():.6g}"
@@ -785,12 +954,22 @@ def main() -> None:
         out_path=marked_hungarian,
         highlight_cells=changed,
     )
-    render_side_by_side(args.out, args.hungarian_out, args.compare_out)
+    sinkhorn_label = (
+        "Sinkhorn greedy"
+        if args.rounding == "greedy"
+        else "Sinkhorn recursive repair"
+    )
+    render_side_by_side(
+        args.out,
+        args.hungarian_out,
+        args.compare_out,
+        left_label=sinkhorn_label,
+    )
     render_side_by_side(
         marked_sinkhorn,
         marked_hungarian,
         args.marked_compare_out,
-        left_label="Sinkhorn rounded (red cells differ)",
+        left_label=f"{sinkhorn_label} (red cells differ)",
         right_label="Hungarian exact (red cells differ)",
     )
 

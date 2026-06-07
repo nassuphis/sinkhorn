@@ -70,9 +70,13 @@ The `outputs/` directory is generated and is intentionally not tracked.
 
 ### Example Debug Plots
 
-Sinkhorn rounded assignment:
+Greedy Sinkhorn rounded assignment:
 
 ![Sinkhorn debug assignment](docs/images/andros_sinkhorn_debug.png)
+
+Recursive Sinkhorn repair assignment:
+
+![Recursive Sinkhorn debug assignment](docs/images/andros_recursive_sinkhorn_debug.png)
 
 Hungarian exact assignment:
 
