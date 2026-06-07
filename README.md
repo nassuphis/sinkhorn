@@ -46,7 +46,8 @@ uv run python image_grid_sinkhorn.py \
   --input andros_thumbnails \
   --out outputs/andros_sinkhorn_mosaic.png \
   --layout outputs/andros_sinkhorn_layout.csv \
-  --debug outputs/andros_sinkhorn_debug.png
+  --debug outputs/andros_sinkhorn_debug.png \
+  --hungarian-debug outputs/andros_hungarian_debug.png
 ```
 
 The script extracts simple visual features, runs PCA followed by t-SNE, solves a
@@ -56,12 +57,32 @@ computes the exact Hungarian grid assignment on the same embedding and writes:
 
 - `outputs/andros_sinkhorn_mosaic.png`
 - `outputs/andros_hungarian_mosaic.png`
+- `outputs/andros_sinkhorn_debug.png`
+- `outputs/andros_hungarian_debug.png`
 - `outputs/andros_sinkhorn_vs_hungarian.png`
 - `outputs/andros_sinkhorn_vs_hungarian_marked.png`
 - `outputs/andros_sinkhorn_vs_hungarian.csv`
 
 In the marked comparison image, red boxes indicate grid cells whose contents
 differ between the rounded Sinkhorn layout and the exact Hungarian layout.
+
+### Example Debug Plots
+
+Sinkhorn rounded assignment:
+
+![Sinkhorn debug assignment](docs/images/andros_sinkhorn_debug.png)
+
+Hungarian exact assignment:
+
+![Hungarian debug assignment](docs/images/andros_hungarian_debug.png)
+
+### Sinkhorn vs Hungarian Grid Assignment
+
+The image below shows the rounded Sinkhorn layout on the left and the exact
+Hungarian layout on the right. Red boxes mark cells where the image differs
+between the two assignments.
+
+![Sinkhorn vs Hungarian marked comparison](docs/images/andros_sinkhorn_vs_hungarian_marked.jpg)
 
 ## Rebuild Report
 
