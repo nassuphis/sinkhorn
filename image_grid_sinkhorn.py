@@ -7,6 +7,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
@@ -21,6 +22,8 @@ from scipy.optimize import linear_sum_assignment
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+SinkhornFn = Callable[[np.ndarray, float], tuple[np.ndarray, float, float, int]]
+HungarianFn = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
 @dataclass(frozen=True)
@@ -247,6 +250,50 @@ def sinkhorn_log(
     return plan, row_error, col_error, iterations
 
 
+def load_c_runner(build: bool):
+    from sinkhorn_mt_benchmark import SinkhornMT, build_library, library_path
+
+    if build or not library_path().exists():
+        build_library()
+    return SinkhornMT()
+
+
+def make_sinkhorn_fn(
+    backend: str,
+    iterations: int,
+    tol: float,
+    threads: int,
+    c_runner,
+) -> SinkhornFn:
+    if backend == "python":
+        def run_python(cost: np.ndarray, epsilon: float) -> tuple[np.ndarray, float, float, int]:
+            return sinkhorn_log(cost, epsilon=epsilon, iterations=iterations, tol=tol)
+
+        return run_python
+
+    if c_runner is None:
+        raise ValueError("C Sinkhorn backend needs a C runner")
+
+    def run_c(cost: np.ndarray, epsilon: float) -> tuple[np.ndarray, float, float, int]:
+        if cost.shape[0] != cost.shape[1]:
+            raise ValueError("C Sinkhorn backend needs a square augmented cost matrix")
+        result = c_runner.run(
+            cost,
+            epsilon=epsilon,
+            iterations=iterations,
+            threads=threads,
+            return_plan=True,
+        )
+        return (
+            np.asarray(result["plan"], dtype=np.float64),
+            float(result["row_error"]),
+            float(result["col_error"]),
+            iterations,
+        )
+
+    return run_c
+
+
 def augment_cost(cost: np.ndarray, cell_count: int) -> np.ndarray:
     image_count = cost.shape[0]
     if image_count > cell_count:
@@ -302,8 +349,8 @@ def recursive_sinkhorn_round(
     image_count: int,
     seed: int,
     epsilon: float,
-    iterations: int,
-    tol: float,
+    sinkhorn_fn: SinkhornFn,
+    hungarian_fn: HungarianFn,
     max_rounds: int,
     candidates_per_image: int,
     repair_epsilon_scale: float,
@@ -372,11 +419,9 @@ def recursive_sinkhorn_round(
 
         local_cost = cost[np.ix_(repair_images, candidate_cells)]
         repair_epsilon = max(epsilon * (repair_scale ** repair_round), 1e-8)
-        local_plan, _, _, _ = sinkhorn_log(
+        local_plan, _, _, _ = sinkhorn_fn(
             augment_cost(local_cost, candidate_cells.size),
-            epsilon=repair_epsilon,
-            iterations=iterations,
-            tol=tol,
+            repair_epsilon,
         )
         local_scores = local_plan[:repair_images.size, :].copy()
         local_scores += rng.random(local_scores.shape) * 1e-12
@@ -401,7 +446,7 @@ def recursive_sinkhorn_round(
         locked_cells[assigned[stable]] = True
         candidate_cells = np.flatnonzero(~locked_cells)
         local_cost = cost[np.ix_(repair_images, candidate_cells)]
-        local_assigned, _ = hungarian_assign(local_cost)
+        local_assigned, _ = hungarian_fn(local_cost)
         assigned[repair_images] = candidate_cells[local_assigned]
         stats["final_hungarian_fallbacks"] += 1
         stats["local_repairs"] += 1
@@ -411,6 +456,18 @@ def recursive_sinkhorn_round(
     assigned_score = plan[np.arange(image_count), assigned]
     assigned_cost = cost[np.arange(image_count), assigned]
     return assigned, assigned_score, assigned_cost, margin, stats
+
+
+def c_hungarian_assign(cost: np.ndarray, c_runner) -> tuple[np.ndarray, np.ndarray]:
+    if c_runner is None:
+        raise ValueError("C Hungarian backend needs a C runner")
+    if cost.shape[0] > cost.shape[1]:
+        raise ValueError("C Hungarian adapter needs at least as many columns as rows")
+    augmented = augment_cost(cost, cost.shape[1])
+    result = c_runner.run_hungarian(augmented, return_perm=True)
+    assigned = np.asarray(result["perm"][:cost.shape[0]], dtype=int)
+    assigned_cost = cost[np.arange(cost.shape[0]), assigned]
+    return assigned, assigned_cost
 
 
 def hungarian_assign(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -723,6 +780,29 @@ def main() -> None:
     parser.add_argument("--epsilon", type=float, default=None)
     parser.add_argument("--epsilon-scale", type=float, default=1.0)
     parser.add_argument(
+        "--sinkhorn-backend",
+        choices=("python", "c"),
+        default="python",
+        help="Sinkhorn implementation used for the transport plan.",
+    )
+    parser.add_argument(
+        "--sinkhorn-threads",
+        type=int,
+        default=8,
+        help="Thread count for the C Sinkhorn backend.",
+    )
+    parser.add_argument(
+        "--hungarian-backend",
+        choices=("scipy", "c"),
+        default="scipy",
+        help="Exact assignment implementation used for comparison and fallback.",
+    )
+    parser.add_argument(
+        "--build-c-library",
+        action="store_true",
+        help="Build libsinkhorn_mt before using a C backend.",
+    )
+    parser.add_argument(
         "--rounding",
         choices=("greedy", "recursive-sinkhorn"),
         default="greedy",
@@ -796,13 +876,34 @@ def main() -> None:
         epsilon = auto_epsilon(cost, args.epsilon_scale)
     print(f"grid = {rows} x {cols} ({rows * cols} cells), epsilon = {epsilon:.6g}")
 
-    print("running log-domain Sinkhorn")
-    augmented_cost = augment_cost(cost, rows * cols)
-    plan, row_error, col_error, used_iterations = sinkhorn_log(
-        augmented_cost,
-        epsilon=epsilon,
+    c_runner = None
+    if args.sinkhorn_backend == "c" or args.hungarian_backend == "c":
+        c_runner = load_c_runner(args.build_c_library)
+
+    if args.hungarian_backend == "c":
+        def exact_assign(candidate_cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            return c_hungarian_assign(candidate_cost, c_runner)
+    else:
+        exact_assign = hungarian_assign
+
+    sinkhorn_fn = make_sinkhorn_fn(
+        args.sinkhorn_backend,
         iterations=args.sinkhorn_iterations,
         tol=args.sinkhorn_tol,
+        threads=args.sinkhorn_threads,
+        c_runner=c_runner,
+    )
+
+    backend_label = (
+        f"C Sinkhorn ({args.sinkhorn_threads} threads)"
+        if args.sinkhorn_backend == "c"
+        else "log-domain Python Sinkhorn"
+    )
+    print(f"running {backend_label}")
+    augmented_cost = augment_cost(cost, rows * cols)
+    plan, row_error, col_error, used_iterations = sinkhorn_fn(
+        augmented_cost,
+        epsilon,
     )
     print(
         "sinkhorn iterations = "
@@ -825,8 +926,8 @@ def main() -> None:
                 image_count=len(loaded),
                 seed=args.seed,
                 epsilon=epsilon,
-                iterations=args.sinkhorn_iterations,
-                tol=args.sinkhorn_tol,
+                sinkhorn_fn=sinkhorn_fn,
+                hungarian_fn=exact_assign,
                 max_rounds=args.repair_rounds,
                 candidates_per_image=args.repair_candidates,
                 repair_epsilon_scale=args.repair_epsilon_scale,
@@ -853,8 +954,8 @@ def main() -> None:
         f"mean margin = {top_margin.mean():.6g}"
     )
 
-    print("running exact Hungarian assignment")
-    hungarian_assigned, hungarian_cost = hungarian_assign(cost)
+    print(f"running exact Hungarian assignment ({args.hungarian_backend})")
+    hungarian_assigned, hungarian_cost = exact_assign(cost)
     print(
         f"hungarian: mean cost = {hungarian_cost.mean():.6g}, "
         f"total cost = {hungarian_cost.sum():.6g}"
@@ -954,10 +1055,11 @@ def main() -> None:
         out_path=marked_hungarian,
         highlight_cells=changed,
     )
+    sinkhorn_prefix = "C Sinkhorn" if args.sinkhorn_backend == "c" else "Sinkhorn"
     sinkhorn_label = (
-        "Sinkhorn greedy"
+        f"{sinkhorn_prefix} greedy"
         if args.rounding == "greedy"
-        else "Sinkhorn recursive repair"
+        else f"{sinkhorn_prefix} recursive repair"
     )
     render_side_by_side(
         args.out,

@@ -44,6 +44,9 @@ recreate the mosaics and comparison outputs, run:
 
 ```bash
 uv run python image_grid_sinkhorn.py \
+  --sinkhorn-backend c \
+  --sinkhorn-threads 8 \
+  --hungarian-backend c \
   --input andros_thumbnails \
   --out outputs/andros_sinkhorn_mosaic.png \
   --layout outputs/andros_sinkhorn_layout.csv \
@@ -51,10 +54,13 @@ uv run python image_grid_sinkhorn.py \
   --hungarian-debug outputs/andros_hungarian_debug.png
 ```
 
+Add `--rounding recursive-sinkhorn` to use the recursive local Sinkhorn repair
+mode.
+
 The script extracts simple visual features, runs PCA followed by t-SNE, solves a
-log-domain Sinkhorn transport problem from embedding coordinates to grid
-coordinates, and rounds the soft plan into a one-image-per-cell layout. It also
-computes the exact Hungarian grid assignment on the same embedding and writes:
+Sinkhorn transport problem from embedding coordinates to grid coordinates, and
+rounds the soft plan into a one-image-per-cell layout. It also computes the
+exact Hungarian grid assignment on the same embedding and writes:
 
 - `outputs/andros_sinkhorn_mosaic.png`
 - `outputs/andros_hungarian_mosaic.png`
@@ -81,6 +87,21 @@ rounds. In this mosaic, `m` is usually close to `n`.
 | Greedy Sinkhorn | `O(T n m) + O(n m log m)` | `O(n m)` | Fast soft transport, then greedy one-to-one rounding. Approximate. |
 | Recursive Sinkhorn | `O(T n m) + sum_r O(T k_r l_r) + optional O(k^3)` | `O(n m) + O(max_r k_r l_r)` | Starts from Sinkhorn argmax and repairs duplicate cells locally. Approximate unless the final local Hungarian fallback is used. |
 | Full Hungarian | `O(n^2 m)`, or `O(n^3)` when `m ~= n` | `O(n m)` | Exact minimum-cost one-to-one assignment. |
+
+Measured on the Andros mosaic problem after feature extraction and t-SNE:
+`n = 493` images, `m = 494` grid cells, grid `19 x 26`, global Sinkhorn
+iterations `T = 1500`. Sinkhorn uses the pthread C implementation with 8
+threads. Hungarian uses the serial C implementation from the same shared
+library. Times are the median of five runs on an Apple Silicon `arm64` machine
+and exclude image loading, feature extraction, t-SNE, and rendering. The
+recursive run used six local Sinkhorn repair rounds and one final local C
+Hungarian fallback to guarantee unique cells.
+
+| Method | Implementation | Threads | Median time | Run times | Mean assignment cost | Relative to Hungarian |
+|---|---|---:|---:|---:|---:|---:|
+| Greedy Sinkhorn | C Sinkhorn + Python greedy rounding | `8` | `0.143 s` | `0.146, 0.145, 0.141, 0.141, 0.143 s` | `0.029803` | `4.8x slower` |
+| Recursive Sinkhorn | C Sinkhorn repairs + final local C Hungarian fallback | `8` | `0.375 s` | `0.370, 0.375, 0.377, 0.376, 0.375 s` | `0.022157` | `12.4x slower` |
+| Full Hungarian | C Hungarian | `1` | `0.030 s` | `0.031, 0.030, 0.030, 0.030, 0.030 s` | `0.020552` | `1x` |
 
 ### Example Debug Plots
 
