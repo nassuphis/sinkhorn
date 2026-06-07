@@ -17,6 +17,7 @@ if not os.environ.get("LOKY_MAX_CPU_COUNT"):
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
+from scipy.optimize import linear_sum_assignment
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -295,6 +296,16 @@ def greedy_round(
     return assigned, assigned_score, assigned_cost, margin
 
 
+def hungarian_assign(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    row_ind, col_ind = linear_sum_assignment(cost)
+    assigned = np.full(cost.shape[0], -1, dtype=int)
+    assigned[row_ind] = col_ind
+    if np.any(assigned < 0):
+        raise RuntimeError("Hungarian assignment did not assign every image")
+    assigned_cost = cost[np.arange(cost.shape[0]), assigned]
+    return assigned, assigned_cost
+
+
 def render_mosaic(
     loaded: list[LoadedImage],
     assigned: np.ndarray,
@@ -303,6 +314,7 @@ def render_mosaic(
     cell_size: tuple[int, int],
     gap: int,
     out_path: Path,
+    highlight_cells: np.ndarray | None = None,
 ) -> None:
     cell_w, cell_h = cell_size
     width = cols * cell_w + (cols + 1) * gap
@@ -332,8 +344,64 @@ def render_mosaic(
         )
         canvas.paste(thumb, (x0, y0))
 
+    if highlight_cells is not None:
+        for cell_idx, highlight in enumerate(highlight_cells):
+            if not highlight:
+                continue
+            row = int(cell_idx // cols)
+            col = int(cell_idx % cols)
+            x0 = gap + col * (cell_w + gap)
+            y0 = gap + row * (cell_h + gap)
+            for inset in range(3):
+                draw.rectangle(
+                    [
+                        x0 + inset,
+                        y0 + inset,
+                        x0 + cell_w - 1 - inset,
+                        y0 + cell_h - 1 - inset,
+                    ],
+                    outline=(230, 40, 35),
+                )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
+
+
+def render_side_by_side(
+    left_path: Path,
+    right_path: Path,
+    out_path: Path,
+    left_label: str = "Sinkhorn rounded",
+    right_label: str = "Hungarian exact",
+) -> None:
+    left = Image.open(left_path).convert("RGB")
+    right = Image.open(right_path).convert("RGB")
+    label_h = 46
+    gap = 16
+    width = left.width + right.width + gap
+    height = max(left.height, right.height) + label_h
+    canvas = Image.new("RGB", (width, height), (250, 250, 248))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((12, 14), left_label, fill=(20, 20, 20))
+    draw.text((left.width + gap + 12, 14), right_label, fill=(20, 20, 20))
+    canvas.paste(left, (0, label_h))
+    canvas.paste(right, (left.width + gap, label_h))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+
+
+def changed_cells(
+    sinkhorn_assigned: np.ndarray,
+    hungarian_assigned: np.ndarray,
+    cell_count: int,
+) -> np.ndarray:
+    sink_by_cell = np.full(cell_count, -1, dtype=int)
+    hung_by_cell = np.full(cell_count, -1, dtype=int)
+    for image_idx, cell_idx in enumerate(sinkhorn_assigned):
+        sink_by_cell[cell_idx] = image_idx
+    for image_idx, cell_idx in enumerate(hungarian_assigned):
+        hung_by_cell[cell_idx] = image_idx
+    return sink_by_cell != hung_by_cell
 
 
 def render_debug(
@@ -434,6 +502,81 @@ def write_layout(
             ])
 
 
+def write_comparison(
+    out_path: Path,
+    loaded: list[LoadedImage],
+    grid: np.ndarray,
+    sinkhorn_assigned: np.ndarray,
+    sinkhorn_score: np.ndarray,
+    sinkhorn_cost: np.ndarray,
+    sinkhorn_margin: np.ndarray,
+    hungarian_assigned: np.ndarray,
+    hungarian_cost: np.ndarray,
+    rows: int,
+    cols: int,
+) -> dict[str, float]:
+    same_cell = sinkhorn_assigned == hungarian_assigned
+    grid_delta = grid[sinkhorn_assigned] - grid[hungarian_assigned]
+    euclid = np.sqrt(np.sum(grid_delta * grid_delta, axis=1))
+    manhattan_cells = (
+        np.abs(sinkhorn_assigned // cols - hungarian_assigned // cols) +
+        np.abs(sinkhorn_assigned % cols - hungarian_assigned % cols)
+    )
+    cost_delta = sinkhorn_cost - hungarian_cost
+    stats = {
+        "same_cells": float(np.sum(same_cell)),
+        "same_cell_fraction": float(np.mean(same_cell)),
+        "mean_sinkhorn_cost": float(np.mean(sinkhorn_cost)),
+        "mean_hungarian_cost": float(np.mean(hungarian_cost)),
+        "total_sinkhorn_cost": float(np.sum(sinkhorn_cost)),
+        "total_hungarian_cost": float(np.sum(hungarian_cost)),
+        "mean_cost_delta": float(np.mean(cost_delta)),
+        "mean_grid_euclidean_move": float(np.mean(euclid)),
+        "mean_grid_manhattan_cells": float(np.mean(manhattan_cells)),
+        "max_grid_manhattan_cells": float(np.max(manhattan_cells)),
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "image_index",
+            "filename",
+            "sinkhorn_row",
+            "sinkhorn_col",
+            "hungarian_row",
+            "hungarian_col",
+            "same_cell",
+            "grid_euclidean_move",
+            "grid_manhattan_cells",
+            "sinkhorn_score",
+            "sinkhorn_margin",
+            "sinkhorn_cost",
+            "hungarian_cost",
+            "cost_delta",
+        ])
+        for image_idx, item in enumerate(loaded):
+            s_cell = int(sinkhorn_assigned[image_idx])
+            h_cell = int(hungarian_assigned[image_idx])
+            writer.writerow([
+                image_idx,
+                item.path.name,
+                s_cell // cols,
+                s_cell % cols,
+                h_cell // cols,
+                h_cell % cols,
+                int(same_cell[image_idx]),
+                f"{euclid[image_idx]:.12g}",
+                int(manhattan_cells[image_idx]),
+                f"{sinkhorn_score[image_idx]:.12g}",
+                f"{sinkhorn_margin[image_idx]:.12g}",
+                f"{sinkhorn_cost[image_idx]:.12g}",
+                f"{hungarian_cost[image_idx]:.12g}",
+                f"{cost_delta[image_idx]:.12g}",
+            ])
+    return stats
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Embed thumbnails with PCA/t-SNE and snap them to a grid with Sinkhorn."
@@ -442,6 +585,11 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("outputs/andros_sinkhorn_mosaic.png"))
     parser.add_argument("--layout", type=Path, default=Path("outputs/andros_sinkhorn_layout.csv"))
     parser.add_argument("--debug", type=Path, default=Path("outputs/andros_sinkhorn_debug.png"))
+    parser.add_argument("--hungarian-out", type=Path, default=Path("outputs/andros_hungarian_mosaic.png"))
+    parser.add_argument("--hungarian-layout", type=Path, default=Path("outputs/andros_hungarian_layout.csv"))
+    parser.add_argument("--compare-out", type=Path, default=Path("outputs/andros_sinkhorn_vs_hungarian.png"))
+    parser.add_argument("--marked-compare-out", type=Path, default=Path("outputs/andros_sinkhorn_vs_hungarian_marked.png"))
+    parser.add_argument("--compare-layout", type=Path, default=Path("outputs/andros_sinkhorn_vs_hungarian.csv"))
     parser.add_argument("--rows", type=int, default=None)
     parser.add_argument("--cols", type=int, default=None)
     parser.add_argument("--cell-size", type=parse_size, default=(120, 90))
@@ -535,6 +683,13 @@ def main() -> None:
         f"mean margin = {top_margin.mean():.6g}"
     )
 
+    print("running exact Hungarian assignment")
+    hungarian_assigned, hungarian_cost = hungarian_assign(cost)
+    print(
+        f"hungarian: mean cost = {hungarian_cost.mean():.6g}, "
+        f"total cost = {hungarian_cost.sum():.6g}"
+    )
+
     render_mosaic(
         loaded,
         assigned,
@@ -543,6 +698,15 @@ def main() -> None:
         cell_size=args.cell_size,
         gap=args.gap,
         out_path=args.out,
+    )
+    render_mosaic(
+        loaded,
+        hungarian_assigned,
+        rows=rows,
+        cols=cols,
+        cell_size=args.cell_size,
+        gap=args.gap,
+        out_path=args.hungarian_out,
     )
     render_debug(
         embedding,
@@ -564,10 +728,79 @@ def main() -> None:
         rows=rows,
         cols=cols,
     )
+    write_layout(
+        args.hungarian_layout,
+        loaded,
+        embedding_raw,
+        embedding,
+        grid,
+        hungarian_assigned,
+        np.full(len(loaded), np.nan),
+        hungarian_cost,
+        np.full(len(loaded), np.nan),
+        rows=rows,
+        cols=cols,
+    )
+    comparison_stats = write_comparison(
+        args.compare_layout,
+        loaded,
+        grid,
+        assigned,
+        assigned_score,
+        assigned_cost,
+        top_margin,
+        hungarian_assigned,
+        hungarian_cost,
+        rows=rows,
+        cols=cols,
+    )
+    changed = changed_cells(assigned, hungarian_assigned, rows * cols)
+    marked_sinkhorn = args.compare_out.with_name(args.compare_out.stem + "_sinkhorn_marked.png")
+    marked_hungarian = args.compare_out.with_name(args.compare_out.stem + "_hungarian_marked.png")
+    render_mosaic(
+        loaded,
+        assigned,
+        rows=rows,
+        cols=cols,
+        cell_size=args.cell_size,
+        gap=args.gap,
+        out_path=marked_sinkhorn,
+        highlight_cells=changed,
+    )
+    render_mosaic(
+        loaded,
+        hungarian_assigned,
+        rows=rows,
+        cols=cols,
+        cell_size=args.cell_size,
+        gap=args.gap,
+        out_path=marked_hungarian,
+        highlight_cells=changed,
+    )
+    render_side_by_side(args.out, args.hungarian_out, args.compare_out)
+    render_side_by_side(
+        marked_sinkhorn,
+        marked_hungarian,
+        args.marked_compare_out,
+        left_label="Sinkhorn rounded (red cells differ)",
+        right_label="Hungarian exact (red cells differ)",
+    )
 
     print(f"wrote {args.out}")
     print(f"wrote {args.layout}")
     print(f"wrote {args.debug}")
+    print(f"wrote {args.hungarian_out}")
+    print(f"wrote {args.hungarian_layout}")
+    print(f"wrote {args.compare_out}")
+    print(f"wrote {args.marked_compare_out}")
+    print(f"wrote {args.compare_layout}")
+    print(
+        "comparison: "
+        f"{comparison_stats['same_cells']:.0f}/{len(loaded)} same cells "
+        f"({comparison_stats['same_cell_fraction']:.1%}), "
+        f"mean grid move = {comparison_stats['mean_grid_manhattan_cells']:.2f} cells, "
+        f"mean cost delta = {comparison_stats['mean_cost_delta']:.6g}"
+    )
 
 
 if __name__ == "__main__":

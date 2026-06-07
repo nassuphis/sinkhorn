@@ -51,7 +51,17 @@ uv run python image_grid_sinkhorn.py \
 
 The script extracts simple visual features, runs PCA followed by t-SNE, solves a
 log-domain Sinkhorn transport problem from embedding coordinates to grid
-coordinates, and rounds the soft plan into a one-image-per-cell layout.
+coordinates, and rounds the soft plan into a one-image-per-cell layout. It also
+computes the exact Hungarian grid assignment on the same embedding and writes:
+
+- `outputs/andros_sinkhorn_mosaic.png`
+- `outputs/andros_hungarian_mosaic.png`
+- `outputs/andros_sinkhorn_vs_hungarian.png`
+- `outputs/andros_sinkhorn_vs_hungarian_marked.png`
+- `outputs/andros_sinkhorn_vs_hungarian.csv`
+
+In the marked comparison image, red boxes indicate grid cells whose contents
+differ between the rounded Sinkhorn layout and the exact Hungarian layout.
 
 ## Rebuild Report
 
