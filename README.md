@@ -68,6 +68,20 @@ In the marked comparison image, red boxes indicate grid cells whose contents
 differ between the rounded Sinkhorn layout and the exact Hungarian layout.
 The `outputs/` directory is generated and is intentionally not tracked.
 
+### Assignment Cost
+
+The table below counts the grid-assignment step after features and t-SNE have
+already been computed. Let `n` be the number of images, `m` the number of grid
+cells, `T` the number of global Sinkhorn iterations, `k_r` and `l_r` the number
+of images and candidate cells in repair round `r`, and `R` the number of repair
+rounds. In this mosaic, `m` is usually close to `n`.
+
+| Method | Computational cost | Memory | Result |
+|---|---:|---:|---|
+| Greedy Sinkhorn | `O(T n m) + O(n m log m)` | `O(n m)` | Fast soft transport, then greedy one-to-one rounding. Approximate. |
+| Recursive Sinkhorn | `O(T n m) + sum_r O(T k_r l_r) + optional O(k^3)` | `O(n m) + O(max_r k_r l_r)` | Starts from Sinkhorn argmax and repairs duplicate cells locally. Approximate unless the final local Hungarian fallback is used. |
+| Full Hungarian | `O(n^2 m)`, or `O(n^3)` when `m ~= n` | `O(n m)` | Exact minimum-cost one-to-one assignment. |
+
 ### Example Debug Plots
 
 Greedy Sinkhorn rounded assignment:
