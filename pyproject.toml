@@ -5,6 +5,8 @@ description = "Tiny NumPy benchmark comparing exact assignment and Sinkhorn tran
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
+    "pillow>=12.2.0",
+    "scikit-learn>=1.7.2",
 ]
 
 [tool.uv]

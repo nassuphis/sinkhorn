@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+.DS_Store
 
 # Compiled C artifacts
 *.dylib
@@ -17,3 +18,8 @@ figure/
 
 # Source/reference PDFs not produced by this repository
 sinkhorm.pdf
+papers/
+
+# Local image data and generated mosaics
+andros_thumbnails/
+outputs/
