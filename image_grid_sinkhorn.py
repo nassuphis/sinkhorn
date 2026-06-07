@@ -587,6 +587,7 @@ def main() -> None:
     parser.add_argument("--debug", type=Path, default=Path("outputs/andros_sinkhorn_debug.png"))
     parser.add_argument("--hungarian-out", type=Path, default=Path("outputs/andros_hungarian_mosaic.png"))
     parser.add_argument("--hungarian-layout", type=Path, default=Path("outputs/andros_hungarian_layout.csv"))
+    parser.add_argument("--hungarian-debug", type=Path, default=Path("outputs/andros_hungarian_debug.png"))
     parser.add_argument("--compare-out", type=Path, default=Path("outputs/andros_sinkhorn_vs_hungarian.png"))
     parser.add_argument("--marked-compare-out", type=Path, default=Path("outputs/andros_sinkhorn_vs_hungarian_marked.png"))
     parser.add_argument("--compare-layout", type=Path, default=Path("outputs/andros_sinkhorn_vs_hungarian.csv"))
@@ -715,6 +716,13 @@ def main() -> None:
         [item.mean_rgb for item in loaded],
         args.debug,
     )
+    render_debug(
+        embedding,
+        grid,
+        hungarian_assigned,
+        [item.mean_rgb for item in loaded],
+        args.hungarian_debug,
+    )
     write_layout(
         args.layout,
         loaded,
@@ -791,6 +799,7 @@ def main() -> None:
     print(f"wrote {args.debug}")
     print(f"wrote {args.hungarian_out}")
     print(f"wrote {args.hungarian_layout}")
+    print(f"wrote {args.hungarian_debug}")
     print(f"wrote {args.compare_out}")
     print(f"wrote {args.marked_compare_out}")
     print(f"wrote {args.compare_layout}")
