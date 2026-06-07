@@ -20,6 +20,5 @@ figure/
 sinkhorm.pdf
 papers/
 
-# Local image data and generated mosaics
-andros_thumbnails/
+# Generated mosaics
 outputs/

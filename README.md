@@ -39,7 +39,8 @@ uv run python sinkhorn_mt_benchmark.py --build --cost-kind flat
 
 ## Build Image Mosaic
 
-Place thumbnails in `andros_thumbnails/`, then run:
+The example Andros thumbnail set is included in `andros_thumbnails/`. To
+recreate the mosaics and comparison outputs, run:
 
 ```bash
 uv run python image_grid_sinkhorn.py \
@@ -65,6 +66,7 @@ computes the exact Hungarian grid assignment on the same embedding and writes:
 
 In the marked comparison image, red boxes indicate grid cells whose contents
 differ between the rounded Sinkhorn layout and the exact Hungarian layout.
+The `outputs/` directory is generated and is intentionally not tracked.
 
 ### Example Debug Plots
 
